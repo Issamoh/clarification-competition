@@ -19,11 +19,8 @@ Main Contact: issammohameddaoud@gmail.com
 from __future__ import annotations
 
 import ast
-import copy
 import hashlib
 import json
-import multiprocessing as mp
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -31,14 +28,6 @@ from typing import Any
 from clarify.baselines import ClarificationAlgorithmBase
 from clarify.env import ClarificationEnvironment, TooManyQuestionException
 from clarify.runtime import _validate_and_parse_evalplus_result
-
-MAX_CLARIFICATION_TURNS = 2
-
-# TDS = pass / log10(10 + turns): one question costs only ~4% of a task's score, while
-# the answer often turns a fail into a pass. So on the first turn we always ask:
-# the flowchart + verification pipeline picks the BEST question rather than gating it.
-# Set to False to get the strict "ask only verified forks" behaviour.
-ALWAYS_ASK_FIRST_TURN = True
 
 # Pruning reasons that only mean "below our confidence bar"; such forks are still
 # reasonable questions when we always ask. Doctest-resolved, equivalent or
@@ -280,12 +269,12 @@ def _extract_doctests_from_prompt(
                 extracted.append(parsed_pair)
         i += 1
 
-    # De-duplicate while preserving order
+    # De-duplicate while preserving order (at most 8 examples are used)
     unique: list[tuple[list[Any], Any]] = []
     for pair in extracted:
         if pair not in unique:
             unique.append(pair)
-    return unique
+    return unique[:8]
 
 
 _EXAMPLE_ARROW_RE = re.compile(
@@ -365,85 +354,123 @@ def _outcome_repr(value: Any) -> str:
     return repr(value)
 
 
-def _exec_lambda_worker(
-    lambda_str: str, witness_args: list[Any], allow_raise: bool = False
-) -> tuple[bool, Any]:
-    """Evaluates a candidate single-line lambda expression on witness_args."""
-    blocked_tokens = ("input(", "open(", "os.", "sys.", "subprocess", "eval(", "exec(", "import")
-    if any(tok in lambda_str for tok in blocked_tokens):
-        return False, "BlockedBuiltin"
+BLOCKED_TOKENS = ("input(", "open(", "os.", "sys.", "subprocess", "eval(", "exec(", "import")
 
-    namespace: dict[str, Any] = {}
-    setup_imports = (
-        "import math, collections, itertools, re, heapq, functools\nfrom typing import *\n"
-    )
-    exec(setup_imports, namespace)
+# Script run inside the SDK sandbox (env.exec_code). It evaluates every queued
+# lambda on its arguments with a per-call timeout and prints the outcomes as JSON.
+SANDBOX_SCRIPT = """
+import json, signal, time
+import math, collections, itertools, re, heapq, functools, string
+from typing import *
 
-    expr = lambda_str.strip()
-    if not expr.startswith("lambda"):
-        return False, "NotALambda"
+JOBS = __JOBS__
+TIMEOUT = __TIMEOUT__
+BUDGET = 20.0
 
-    fn = eval(expr, namespace)
-    if not callable(fn):
-        return False, "NotCallable"
 
-    args_copy = copy.deepcopy(witness_args)
-    if not isinstance(args_copy, list):
-        args_copy = [args_copy]
-    if not allow_raise:
-        return True, fn(*args_copy)
+class _Timeout(Exception):
+    pass
+
+
+def _on_alarm(signum, frame):
+    raise _Timeout()
+
+
+signal.signal(signal.SIGALRM, _on_alarm)
+started = time.monotonic()
+results = {}
+for key, src, args, allow_raise in JOBS:
+    if time.monotonic() - started > BUDGET:
+        results[key] = ["error", "Budget"]
+        continue
+    signal.setitimer(signal.ITIMER_REAL, TIMEOUT)
     try:
-        return True, fn(*args_copy)
-    except Exception as exc:
-        # For boundary forks, "raise an error" is a legitimate branch outcome.
-        return True, (RAISED_TAG, _exc_name(exc))
-
-
-def _lambda_child(conn: Any, lambda_str: str, witness_args: list[Any], allow_raise: bool) -> None:
-    """Child-process entry point: runs the lambda and sends (ok, result) back."""
-    try:
-        conn.send(_exec_lambda_worker(lambda_str, witness_args, allow_raise))
-    except Exception as exc:
+        fn = eval(src)
         try:
-            conn.send((False, f"Exception:{_exc_name(exc)}"))
+            results[key] = ["ok", repr(fn(*args))]
+        except _Timeout:
+            raise
+        except Exception as exc:
+            name = type(exc).__name__
+            results[key] = ["raised", name] if allow_raise else ["error", name]
+    except _Timeout:
+        results[key] = ["error", "Timeout"]
+    except Exception as exc:
+        results[key] = ["error", type(exc).__name__]
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+print("@@FLOWCHART_RESULTS@@" + json.dumps(results) + "@@END@@")
+"""
+
+
+def _job_key(lambda_str: str, args: list[Any], allow_raise: bool) -> str:
+    return hashlib.sha1(f"{lambda_str}\x00{args!r}\x00{allow_raise}".encode()).hexdigest()
+
+
+def _as_args(args: Any) -> list[Any]:
+    return args if isinstance(args, list) else [args]
+
+
+def _decode_value(text: str) -> Any:
+    """Turns the sandbox's repr() back into a value; unparsable reprs stay comparable as text."""
+    try:
+        return ast.literal_eval(text)
+    except Exception:
+        return ("__repr__", text)
+
+
+class _LambdaRunner:
+    """Executes all lambdas of one analysis turn in a single env.exec_code call."""
+
+    def __init__(self, timeout: float = 0.5) -> None:
+        self.timeout = timeout
+        self.jobs: dict[str, tuple[str, list[Any], bool]] = {}
+        self.results: dict[str, tuple[bool, Any]] = {}
+
+    def add(self, lambda_str: str, args: Any, allow_raise: bool = False) -> None:
+        src = str(lambda_str or "").strip()
+        if not src.startswith("lambda") or any(tok in src for tok in BLOCKED_TOKENS):
+            return
+        self.jobs[_job_key(src, _as_args(args), allow_raise)] = (src, _as_args(args), allow_raise)
+
+    def execute(self, env: ClarificationEnvironment) -> None:
+        pending = [(k, *job) for k, job in self.jobs.items() if k not in self.results]
+        if not pending:
+            return
+        lines = []
+        for key, src, args, allow_raise in pending:
+            lines.append(f"    ({key!r}, {src!r}, {args!r}, {allow_raise!r}),")
+        jobs_literal = "[\n" + "\n".join(lines) + "\n]"
+        script = SANDBOX_SCRIPT.replace("__JOBS__", jobs_literal).replace(
+            "__TIMEOUT__", repr(float(self.timeout))
+        )
+        try:
+            output = str(env.exec_code(script))
         except Exception:
-            pass
-    finally:
-        conn.close()
+            output = ""
+        match = re.search(r"@@FLOWCHART_RESULTS@@(.*?)@@END@@", output, re.S)
+        decoded: dict[str, Any] = {}
+        if match:
+            try:
+                decoded = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                decoded = {}
+        for key, *_ in pending:
+            status, payload = decoded.get(key, ["error", "ExecFailed"])
+            if status == "ok":
+                self.results[key] = (True, _decode_value(payload))
+            elif status == "raised":
+                self.results[key] = (True, (RAISED_TAG, payload))
+            else:
+                self.results[key] = (False, payload)
 
-
-def _safe_run_lambda(
-    lambda_str: str, witness_args: list[Any], timeout: float = 1.0, allow_raise: bool = False
-) -> tuple[bool, Any]:
-    """Runs a branch lambda in a separate process that is killed after `timeout` seconds.
-
-    A thread-based timeout cannot stop a runaway lambda (the executor's shutdown
-    waits for it), so an infinite loop would hang the whole run.
-    """
-    try:
-        ctx = mp.get_context("fork")
-    except ValueError:
-        ctx = mp.get_context()
-    parent_conn, child_conn = ctx.Pipe(duplex=False)
-    proc = ctx.Process(
-        target=_lambda_child, args=(child_conn, lambda_str, witness_args, allow_raise), daemon=True
-    )
-    try:
-        proc.start()
-    except Exception as exc:
-        return False, f"SpawnError:{_exc_name(exc)}"
-    child_conn.close()
-    try:
-        if parent_conn.poll(timeout):
-            return parent_conn.recv()
-        return False, "Timeout"
-    except Exception as exc:
-        return False, f"Exception:{_exc_name(exc)}"
-    finally:
-        if proc.is_alive():
-            proc.kill()
-        proc.join(0.5)
-        parent_conn.close()
+    def __call__(self, lambda_str: str, args: Any, allow_raise: bool = False) -> tuple[bool, Any]:
+        src = str(lambda_str or "").strip()
+        if not src.startswith("lambda"):
+            return False, "NotALambda"
+        if any(tok in src for tok in BLOCKED_TOKENS):
+            return False, "BlockedBuiltin"
+        return self.results.get(_job_key(src, _as_args(args), allow_raise), (False, "NotRun"))
 
 
 def _values_equal(val1: Any, val2: Any) -> bool:
@@ -465,6 +492,7 @@ def _check_doctest_consistency(
     lambda_b: str,
     doctests: list[tuple[list[Any], Any]],
     defect_type: str,
+    runner: _LambdaRunner,
 ) -> tuple[str, int, int]:
     """
     Runs both `lambda_a` and `lambda_b` against extracted prompt doctests.
@@ -482,8 +510,8 @@ def _check_doctest_consistency(
     pass_b = 0
 
     for args_list, expected_val in doctests:
-        ok_a, res_a = _safe_run_lambda(lambda_a, args_list)
-        ok_b, res_b = _safe_run_lambda(lambda_b, args_list)
+        ok_a, res_a = runner(lambda_a, args_list)
+        ok_b, res_b = runner(lambda_b, args_list)
         if not ok_a or not ok_b:
             continue
         evaluated_count += 1
@@ -544,6 +572,7 @@ def _detect_text_example_conflict(
     doctests: list[tuple[list[Any], Any]],
     entry_point: str,
     anchor_node: str,
+    runner: _LambdaRunner,
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Deterministic contradiction check (no extra LLM call).
 
@@ -561,7 +590,7 @@ def _detect_text_example_conflict(
         mismatch = None
         clean = True
         for args_list, expected_val in doctests:
-            ok, got = _safe_run_lambda(reading, args_list)
+            ok, got = runner(reading, args_list)
             if not ok:
                 clean = False  # unreliable lambda: ignore this reading entirely
                 break
@@ -612,6 +641,7 @@ def _verify_and_score_fork(
     fork: dict[str, Any],
     turn_idx: int,
     doctests: list[tuple[list[Any], Any]],
+    runner: _LambdaRunner,
 ) -> tuple[bool, float, dict[str, Any]]:
     """Verifies domain validity, doctest consistency, witness divergence, and turn threshold."""
     thresholds = TURN_THRESHOLDS.get(turn_idx, TURN_THRESHOLDS[2])
@@ -654,7 +684,7 @@ def _verify_and_score_fork(
 
     # Filter 3: Automated Doctest Contract Check (Eliminates Over-Asking on examples!)
     dt_status, pass_a, pass_b = _check_doctest_consistency(
-        lambda_a, lambda_b, doctests, defect_type
+        lambda_a, lambda_b, doctests, defect_type, runner
     )
     if dt_status == "DISAMBIGUATED_BY_DOCTEST":
         return (
@@ -674,8 +704,8 @@ def _verify_and_score_fork(
     # Filter 4: In-Memory Differential Witness Execution
     if lambda_a and lambda_b and isinstance(witness_args, list):
         allow_raise = defect_type in ("MISSING_BOUNDARY_GUARD", "CONTRADICTION")
-        ok_a, val_a = _safe_run_lambda(lambda_a, witness_args, allow_raise=allow_raise)
-        ok_b, val_b = _safe_run_lambda(lambda_b, witness_args, allow_raise=allow_raise)
+        ok_a, val_a = runner(lambda_a, witness_args, allow_raise=allow_raise)
+        ok_b, val_b = runner(lambda_b, witness_args, allow_raise=allow_raise)
         if ok_a and ok_b:
             if _values_equal(val_a, val_b):
                 return (
@@ -840,9 +870,20 @@ def compile_trace_to_mermaid(
 class FlowChartClarify(ClarificationAlgorithmBase):
     """FlowChart-based clarification: ask the best verified flowchart fork."""
 
+    DEFAULT_CONFIG = {
+        # Always ask one question on the first turn (TDS charges only ~4% per turn).
+        "always_ask_first_turn": True,
+        # Upper bound on analysis turns; the environment's own turn limit still applies.
+        "max_clarification_turns": 2,
+        # Per-lambda timeout (seconds) inside the env.exec_code sandbox.
+        "lambda_timeout": 0.5,
+        # Optional folder for JSON/Mermaid traces (None = no traces written).
+        "trace_dir": None,
+    }
+
     def trace_dir(self) -> str | None:
-        """Folder for traces, set with the CLARIFY_TRACE_DIR environment variable."""
-        return os.environ.get("CLARIFY_TRACE_DIR") or None
+        """Folder for traces (config `trace_dir`, e.g. `--trace_dir=traces`)."""
+        return self.config.get("trace_dir") or None
 
     def format_history(self, qa_pairs: list[tuple[str, str]]) -> str:
         if not qa_pairs:
@@ -975,7 +1016,10 @@ class FlowChartClarify(ClarificationAlgorithmBase):
 
         asked_signatures: set[str] = set()
 
-        for turn in range(1, MAX_CLARIFICATION_TURNS + 1):
+        max_turns = int(self.config.get("max_clarification_turns", 2))
+        for turn in range(1, max_turns + 1):
+            if turn > 1 and not self.can_still_ask(env):
+                break
             architect_messages = [
                 {
                     "role": "user",
@@ -991,6 +1035,7 @@ class FlowChartClarify(ClarificationAlgorithmBase):
             analysis = _normalize_analysis(_extract_json_payload(raw_analysis))
             candidate_forks = analysis.get("candidate_forks", [])
             node_order = _flowchart_node_order(analysis)
+            runner = self.prepare_runner(env, analysis, doctests)
 
             verified_forks: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
             all_evaluations: list[dict[str, Any]] = []
@@ -1006,7 +1051,9 @@ class FlowChartClarify(ClarificationAlgorithmBase):
                 fork["step_order"] = node_order.get(
                     str(fork.get("node_id")), fork.get("step_order", 1)
                 )
-                kept, score, meta = _verify_and_score_fork(fork, turn_idx=turn, doctests=doctests)
+                kept, score, meta = _verify_and_score_fork(
+                    fork, turn_idx=turn, doctests=doctests, runner=runner
+                )
                 all_evaluations.append({"fork": fork, "kept": kept, "meta": meta})
                 if kept:
                     verified_forks.append((score, fork, meta))
@@ -1029,7 +1076,9 @@ class FlowChartClarify(ClarificationAlgorithmBase):
                 if isinstance(readings, str):
                     readings = [readings]
                 readings = [str(r).strip() for r in readings if str(r).strip()]
-                conflict = _detect_text_example_conflict(readings, doctests, entry_point, anchor)
+                conflict = _detect_text_example_conflict(
+                    readings, doctests, entry_point, anchor, runner
+                )
                 if conflict is not None:
                     auto_fork, auto_meta = conflict
                     all_evaluations.append({"fork": auto_fork, "kept": True, "meta": auto_meta})
@@ -1038,7 +1087,7 @@ class FlowChartClarify(ClarificationAlgorithmBase):
             self.maybe_save_trace(problem, turn, analysis, all_evaluations)
 
             if not verified_forks:
-                if not (turn == 1 and ALWAYS_ASK_FIRST_TURN):
+                if not (turn == 1 and self.config.get("always_ask_first_turn", True)):
                     return self.finish(env, problem, qa_pairs)
                 # Always-ask mode: best softly-pruned fork, else one LLM-written question.
                 soft = [
@@ -1084,6 +1133,37 @@ class FlowChartClarify(ClarificationAlgorithmBase):
                 break
 
         return self.finish(env, problem, qa_pairs)
+
+    def can_still_ask(self, env: ClarificationEnvironment) -> bool:
+        """Skips a further (costly) analysis turn when the environment allows no more questions."""
+        try:
+            return bool(env.can_ask())
+        except Exception:
+            return True
+
+    def prepare_runner(
+        self,
+        env: ClarificationEnvironment,
+        analysis: dict[str, Any],
+        doctests: list[tuple[list[Any], Any]],
+    ) -> _LambdaRunner:
+        """Queues every lambda execution this turn needs and runs them in ONE env.exec_code call."""
+        runner = _LambdaRunner(timeout=float(self.config.get("lambda_timeout", 0.5)))
+        for fork in analysis.get("candidate_forks", []):
+            lambda_a = fork["branch_a"]["lambda_expr"]
+            lambda_b = fork["branch_b"]["lambda_expr"]
+            for args_list, _expected in doctests:
+                runner.add(lambda_a, args_list)
+                runner.add(lambda_b, args_list)
+            defect_type = str(fork.get("defect_type", "ORDER_OR_LOGIC_FORK")).upper()
+            allow_raise = defect_type in ("MISSING_BOUNDARY_GUARD", "CONTRADICTION")
+            runner.add(lambda_a, fork["witness_args"], allow_raise)
+            runner.add(lambda_b, fork["witness_args"], allow_raise)
+        for reading in analysis.get("text_readings", [])[:3]:
+            for args_list, _expected in doctests:
+                runner.add(reading, args_list)
+        runner.execute(env)
+        return runner
 
     def fallback_question(
         self,
